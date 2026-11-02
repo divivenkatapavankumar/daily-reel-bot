@@ -1,4 +1,4 @@
-name: Daily Autonomous Reel & Short Bot
+name: Daily Autonomous Instagram Reel Bot
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Generate video artifact only without uploading to YouTube/Instagram'
+        description: 'Generate video artifact only without uploading to Instagram'
         required: false
         default: 'false'
         type: choice
@@ -43,10 +43,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Daily Reel & Short Pipeline (2+ Min Deep-Dive)
+      - name: Run Daily Instagram Reel Pipeline (2+ Min Kinetic Edition)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash' }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TREND_GEO: ${{ vars.TREND_GEO || 'IN' }}
           NICHE_FILTER: ${{ vars.NICHE_FILTER || 'technology, AI, science, business, finance, or fascinating world news' }}
@@ -55,9 +54,6 @@ jobs:
           MIN_VIDEO_SECONDS: ${{ vars.MIN_VIDEO_SECONDS || '125' }}
           MAX_VIDEO_SECONDS: ${{ vars.MAX_VIDEO_SECONDS || '175' }}
           VISUAL_SOURCE: ${{ vars.VISUAL_SOURCE || 'auto' }}
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USERNAME: ${{ secrets.IG_USERNAME }}

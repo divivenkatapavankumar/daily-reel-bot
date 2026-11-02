@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-Autonomous Daily Trend-to-Reel & YouTube Shorts Bot (2+ Minute Deep-Dive Edition)
-=================================================================================
-End-to-end pipeline designed for daily execution via GitHub Actions (or cron):
+Autonomous Daily Trend-to-Instagram Reels Bot (2+ Minute Kinetic Animation Edition)
+===================================================================================
+End-to-end Instagram Reels pipeline designed for daily execution via GitHub Actions (or cron):
 1. Trend Discovery: Pulls daily trending topics from Google Trends RSS, Google News RSS, and Hacker News API.
 2. AI Scriptwriter: Uses Google Gemini (`google-genai` free tier) to select the top trend and write a
-   12-to-15-scene deep-dive vertical video script (320-380 spoken words, targeting 125-155 seconds / 2+ minutes,
-   within the 3-minute limit for YouTube Shorts and Instagram Reels).
-3. Neural Voiceover: Generates crisp spoken audio per scene using `edge-tts` (100% free, no API key required).
-4. Visuals & 9:16 Video Renderer: Fetches vertical stock clips from Pexels API (free) or generates 1080x1920
-   AI visuals via Pollinations.ai (free, keyless), renders dynamic captions with Pillow, and encodes a
-   1080x1920 H.264 MP4 via FFmpeg guaranteed to be at least `MIN_VIDEO_SECONDS` (default 125s).
-5. Dual Uploader: Publishes automatically to YouTube Shorts (YouTube Data API v3 with OAuth Refresh Token)
-   and Instagram Reels (Official Meta Graph API Resumable Upload or `instagrapi` session fallback).
+   12-to-15-scene deep-dive vertical Reel script (320-380 spoken words, targeting 125-155 seconds / 2+ minutes).
+3. Neural Voiceover + Word Timestamps: Generates spoken audio per scene using `edge-tts` (`WordBoundary`
+   streaming) to extract exact word-by-word timing for karaoke captions.
+4. Kinetic 9:16 Video Engine (FFmpeg + Pillow):
+   - 4-mode 30fps Ken Burns camera motion (Push-In Zoom, Pull-Out Reveal, Pan Left-to-Right, Tilt Upward)
+   - Hormozi/CapCut-style word-by-word active highlight captions with pop-scale neon word pills
+   - Animated audio waveform visualizer bars, pulsing LIVE TREND HUD badge, scene counter (`03/14`),
+     slide-in headline banner, and a continuous timeline progress bar
+   - Crisp scene-to-scene fade transitions and color-grade punch (`1080x1920`, `30fps`, `H.264`)
+5. Instagram Reels Uploader: Publishes automatically to Instagram Reels via Official Meta Graph API
+   Resumable Upload (`IG_USER_ID` + `IG_ACCESS_TOKEN`) or `instagrapi` (`IG_USERNAME` + `IG_PASSWORD` / `IG_SESSION_JSON`).
 
 Usage:
-  python daily_reel_bot.py                     # Run full pipeline (generate 2+ min video + upload)
-  python daily_reel_bot.py --dry-run           # Generate 2+ min video locally without uploading
-  python daily_reel_bot.py --setup-youtube     # Run once locally to obtain YOUTUBE_REFRESH_TOKEN
+  python daily_reel_bot.py                      # Run full pipeline (generate 2+ min animated Reel + upload to Instagram)
+  python daily_reel_bot.py --dry-run            # Generate 2+ min animated Reel locally without uploading
+  python daily_reel_bot.py --setup-ig-session   # Optional: Log in once locally via instagrapi to export IG_SESSION_JSON
 """
 
 from __future__ import annotations
@@ -26,10 +29,10 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import textwrap
 import time
@@ -38,7 +41,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -120,13 +123,7 @@ class BotConfig:
     )  # "auto" | "pexels" | "pollinations"
     pexels_api_key: str = field(default_factory=lambda: os.getenv("PEXELS_API_KEY", "").strip())
 
-    # YouTube Data API v3 credentials
-    yt_client_id: str = field(default_factory=lambda: os.getenv("YOUTUBE_CLIENT_ID", "").strip())
-    yt_client_secret: str = field(default_factory=lambda: os.getenv("YOUTUBE_CLIENT_SECRET", "").strip())
-    yt_refresh_token: str = field(default_factory=lambda: os.getenv("YOUTUBE_REFRESH_TOKEN", "").strip())
-    yt_privacy_status: str = field(default_factory=lambda: os.getenv("YOUTUBE_PRIVACY", "public").strip())
-
-    # Instagram credentials (Official Graph API or instagrapi fallback)
+    # Instagram credentials (Official Meta Graph API or instagrapi fallback)
     ig_user_id: str = field(default_factory=lambda: os.getenv("IG_USER_ID", "").strip())
     ig_access_token: str = field(default_factory=lambda: os.getenv("IG_ACCESS_TOKEN", "").strip())
     ig_username: str = field(default_factory=lambda: os.getenv("IG_USERNAME", "").strip())
@@ -135,6 +132,13 @@ class BotConfig:
 
     output_dir: Path = field(default_factory=lambda: Path(os.getenv("OUTPUT_DIR", "output")))
     history_file: Path = field(default_factory=lambda: Path(os.getenv("HISTORY_FILE", "topic_history.json")))
+
+
+@dataclass
+class WordTiming:
+    word: str
+    start_sec: float
+    end_sec: float
 
 
 @dataclass
@@ -181,9 +185,8 @@ def save_topic_history(history_file: Path, topic: str) -> None:
 def fetch_trending_topics(geo: str = "IN", max_items: int = 20) -> List[dict]:
     """Fetches real-time trending topics from multiple free public feeds."""
     trends: List[dict] = []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailyReelBot/1.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailyReelBot/2.0)"}
 
-    # 1. Google Trends Daily RSS Feed
     gtrends_urls = [
         f"https://trends.google.com/trending/rss?geo={geo}",
         f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}",
@@ -210,7 +213,6 @@ def fetch_trending_topics(geo: str = "IN", max_items: int = 20) -> List[dict]:
         except Exception as exc:
             logger.debug("Google Trends RSS attempt failed (%s): %s", url, exc)
 
-    # 2. Google News Top/Tech Headlines RSS
     gnews_url = f"https://news.google.com/rss?hl=en-{geo}&gl={geo}&ceid={geo}:en"
     try:
         resp = requests.get(gnews_url, headers=headers, timeout=12)
@@ -224,7 +226,6 @@ def fetch_trending_topics(geo: str = "IN", max_items: int = 20) -> List[dict]:
     except Exception as exc:
         logger.debug("Google News RSS fetch failed: %s", exc)
 
-    # 3. Hacker News Top Stories (Free Firebase API)
     try:
         top_ids = requests.get(
             "https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10
@@ -257,7 +258,7 @@ def fetch_trending_topics(geo: str = "IN", max_items: int = 20) -> List[dict]:
 def generate_reel_script(config: BotConfig, trends: List[dict], past_topics: List[str]) -> ReelScript:
     """
     Uses Google Gemini API (google-genai SDK) to pick the best trend and write a 12-to-15 scene
-    deep-dive script totaling 320-380 spoken words (~125-155 seconds / 2+ minutes).
+    deep-dive Instagram Reel script totaling 320-380 spoken words (~125-155 seconds / 2+ minutes).
     """
     if not config.gemini_api_key:
         raise ValueError("GEMINI_API_KEY environment variable is required. Get a free key at https://aistudio.google.com/apikey")
@@ -273,7 +274,7 @@ def generate_reel_script(config: BotConfig, trends: List[dict], past_topics: Lis
     )
     avoid_str = ", ".join(past_topics[-15:]) if past_topics else "None"
 
-    prompt = f"""You are an expert vertical documentary & deep-dive producer for Instagram Reels and YouTube Shorts.
+    prompt = f"""You are an expert vertical documentary & deep-dive producer for Instagram Reels.
 
 Here are today's live trending topics:
 {trends_formatted}
@@ -285,18 +286,18 @@ Preferred niche focus: {config.niche_filter}
 
 Task:
 1. Select the single most compelling, Advertiser-Friendly / Brand-Safe trending topic from the list above.
-2. Write a comprehensive, high-retention 2-to-2.5-minute (125 to 150 seconds) vertical video script broken into **12 to 15 scenes** (total spoken word count MUST be between **320 and 380 words**, with **25 to 30 spoken words per scene**):
+2. Write a comprehensive, high-retention 2-to-2.5-minute (125 to 150 seconds) vertical Instagram Reel script broken into **12 to 15 scenes** (total spoken word count MUST be between **320 and 380 words**, with **25 to 30 spoken words per scene**):
    - Scene 1: Scroll-stopping hook in the first 5 seconds introducing the breaking trend and why everyone is talking about it.
    - Scenes 2-4: Background context—how we got here and the core problem or catalyst.
    - Scenes 5-9: Deep-dive breakdown—key facts, how it works, major players involved, and surprising numbers or details.
    - Scenes 10-12: Real-world impact—what this changes for everyday people, the industry, or the economy.
-   - Final Scene (Scene 13-15): Crisp future outlook and an engaging question to drive viewer comments.
+   - Final Scene (Scene 13-15): Crisp future outlook and an engaging question to drive Instagram comments and shares.
 3. Return STRICT JSON matching this exact schema:
 {{
   "trend_topic": "Exact name of the chosen trend",
-  "title": "Catchy YouTube Shorts title under 65 chars ending with #Shorts",
-  "caption": "Engaging Instagram Reel & YouTube description with a 2-sentence summary and 6-8 relevant hashtags",
-  "tags": ["tag1", "tag2", "tag3", "shorts", "trending"],
+  "title": "Catchy Reel headline under 65 chars",
+  "caption": "Engaging Instagram Reel caption with a 2-sentence hook, key takeaways, a question for comments, and 8-10 relevant hashtags (#Reels #Trending #ExplorePage)",
+  "tags": ["reels", "trending", "explorepage", "tech", "news"],
   "scenes": [
     {{
       "narration": "2 to 3 full, engaging spoken sentences (MUST be 25-30 words per scene, natural spoken English, no emojis or hashtags).",
@@ -307,36 +308,49 @@ Task:
   ]
 }}"""
 
-    response = client.models.generate_content(
-        model=config.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.7,
-        ),
-    )
+    candidate_models = [config.gemini_model]
+    for alt in ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]:
+        if alt not in candidate_models:
+            candidate_models.append(alt)
+
+    def _call_gemini_safe(prompt_text: str, temp: float = 0.7) -> Any:
+        last_exc: Exception | None = None
+        for m in candidate_models:
+            for attempt in range(3):
+                try:
+                    return client.models.generate_content(
+                        model=m,
+                        contents=prompt_text,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=temp,
+                        ),
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    err = str(exc)
+                    logger.warning("Gemini attempt %d on %s failed: %s", attempt + 1, m, exc)
+                    if "503" in err or "429" in err or "UNAVAILABLE" in err:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    break
+        raise RuntimeError(f"All Gemini model attempts failed: {last_exc}")
+
+    response = _call_gemini_safe(prompt, temp=0.7)
 
     raw_text = (response.text or "").strip()
     raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.DOTALL)
     payload: dict[str, Any] = json.loads(raw_text)
 
-    # Verify total spoken word count is sufficient for a 2+ minute video (~300+ words)
     total_words = sum(len(s.get("narration", "").split()) for s in payload.get("scenes", []))
     if total_words < 290:
         logger.info("Initial script was %d words (<290); requesting scene expansion from Gemini for 2+ min length...", total_words)
-        expand_prompt = f"""The JSON script below currently has {total_words} total spoken words across {len(payload.get('scenes', []))} scenes, which is too short for our 2-minute (125+ second) minimum video length.
+        expand_prompt = f"""The JSON script below currently has {total_words} total spoken words across {len(payload.get('scenes', []))} scenes, which is too short for our 2-minute (125+ second) minimum Instagram Reel length.
 
 Expand this script to **13 to 15 scenes** with **26 to 32 spoken words per scene** (at least **340 spoken words total**) by adding deeper context, concrete examples, and implications, while keeping the exact same JSON schema:
 
 {json.dumps(payload)}"""
-        exp_resp = client.models.generate_content(
-            model=config.gemini_model,
-            contents=expand_prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.6,
-            ),
-        )
+        exp_resp = _call_gemini_safe(expand_prompt, temp=0.6)
         exp_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", (exp_resp.text or "").strip(), flags=re.DOTALL)
         payload = json.loads(exp_text)
 
@@ -350,16 +364,12 @@ Expand this script to **13 to 15 scenes** with **26 to 32 spoken words per scene
         for s in payload["scenes"]
     ]
 
-    title = payload["title"].strip()
-    if "#shorts" not in title.lower():
-        title = f"{title[:58].strip()} #Shorts"
-
     final_word_count = sum(len(s.narration.split()) for s in scenes)
     script = ReelScript(
         trend_topic=payload["trend_topic"].strip(),
-        title=title,
+        title=payload["title"].strip(),
         caption=payload["caption"].strip(),
-        tags=[str(t).strip() for t in payload.get("tags", ["shorts", "trending", "reels"])],
+        tags=[str(t).strip() for t in payload.get("tags", ["reels", "trending", "explorepage"])],
         scenes=scenes,
     )
     logger.info(
@@ -373,25 +383,35 @@ Expand this script to **13 to 15 scenes** with **26 to 32 spoken words per scene
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Free Neural Voiceover Generation (edge-tts)
+# Stage 3: Free Neural Voiceover + Word-Level Timestamp Extraction (edge-tts)
 # ---------------------------------------------------------------------------
 
-async def _synthesize_scene_audio(text: str, voice: str, rate: str, out_mp3: Path) -> None:
+async def _synthesize_scene_audio_and_words(
+    text: str,
+    voice: str,
+    rate: str,
+    out_mp3: Path,
+) -> List[WordTiming]:
+    """Streams audio and captures exact WordBoundary timestamps from edge-tts."""
     import edge_tts
 
     communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
-    await communicate.save(str(out_mp3))
+    word_timings: List[WordTiming] = []
+    audio_bytes = bytearray()
 
+    async for chunk in communicate.stream():
+        ctype = chunk.get("type")
+        if ctype == "audio":
+            audio_bytes.extend(chunk["data"])
+        elif ctype == "WordBoundary":
+            start_s = chunk.get("offset", 0) / 10_000_000.0
+            dur_s = max(chunk.get("duration", 0) / 10_000_000.0, 0.12)
+            w_text = str(chunk.get("text", "")).strip()
+            if w_text:
+                word_timings.append(WordTiming(word=w_text, start_sec=start_s, end_sec=start_s + dur_s))
 
-def generate_scene_voiceovers(scenes: List[SceneSpec], voice: str, rate: str, work_dir: Path) -> List[Path]:
-    """Generates an MP3 voiceover for each scene using Microsoft Edge's free neural TTS."""
-    audio_paths: List[Path] = []
-    for idx, scene in enumerate(scenes):
-        out_mp3 = work_dir / f"scene_{idx:02d}_audio.mp3"
-        logger.info("Synthesizing TTS voiceover for scene %d/%d...", idx + 1, len(scenes))
-        asyncio.run(_synthesize_scene_audio(scene.narration, voice, rate, out_mp3))
-        audio_paths.append(out_mp3)
-    return audio_paths
+    out_mp3.write_bytes(bytes(audio_bytes))
+    return word_timings
 
 
 def get_media_duration(media_path: Path) -> float:
@@ -408,6 +428,45 @@ def get_media_duration(media_path: Path) -> float:
     ]
     out = subprocess.check_output(cmd, text=True).strip()
     return max(float(out), 1.5)
+
+
+def build_fallback_word_timings(narration: str, spoken_duration: float) -> List[WordTiming]:
+    """Proportional character-weighted word timings if TTS stream omits WordBoundary events."""
+    words = [w for w in narration.split() if w.strip()]
+    if not words:
+        return [WordTiming(word="", start_sec=0.0, end_sec=spoken_duration)]
+    weights = [max(len(w), 2) for w in words]
+    total_w = sum(weights)
+    cursor = 0.0
+    timings: List[WordTiming] = []
+    for w, weight in zip(words, weights):
+        dur = spoken_duration * (weight / total_w)
+        timings.append(WordTiming(word=w, start_sec=cursor, end_sec=cursor + dur))
+        cursor += dur
+    return timings
+
+
+def generate_scene_voiceovers(
+    scenes: List[SceneSpec],
+    voice: str,
+    rate: str,
+    work_dir: Path,
+) -> Tuple[List[Path], List[List[WordTiming]]]:
+    """Generates MP3 voiceovers and word-level timing arrays for every scene."""
+    audio_paths: List[Path] = []
+    all_word_timings: List[List[WordTiming]] = []
+
+    for idx, scene in enumerate(scenes):
+        out_mp3 = work_dir / f"scene_{idx:02d}_audio.mp3"
+        logger.info("Synthesizing TTS voiceover + word timings for scene %d/%d...", idx + 1, len(scenes))
+        timings = asyncio.run(_synthesize_scene_audio_and_words(scene.narration, voice, rate, out_mp3))
+        spoken_dur = get_media_duration(out_mp3)
+        if not timings:
+            timings = build_fallback_word_timings(scene.narration, spoken_dur)
+        audio_paths.append(out_mp3)
+        all_word_timings.append(timings)
+
+    return audio_paths, all_word_timings
 
 
 def pad_audio_with_silence(in_mp3: Path, target_duration: float, out_mp3: Path) -> Path:
@@ -432,7 +491,7 @@ def pad_audio_with_silence(in_mp3: Path, target_duration: float, out_mp3: Path) 
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: Free Visual Fetching (Pexels Stock Video + Pollinations AI + Fallback)
+# Stage 4A: Free Visual Fetching (Pexels Stock Video + Pollinations AI + Fallback)
 # ---------------------------------------------------------------------------
 
 def fetch_pexels_vertical_video(query: str, api_key: str, out_path: Path) -> bool:
@@ -481,15 +540,15 @@ def fetch_pollinations_vertical_image(prompt: str, seed: int, out_path: Path) ->
 
 
 def create_fallback_background(out_path: Path, scene_idx: int) -> None:
-    """Generates a sleek dark gradient 1080x1920 background using Pillow if network visual calls time out."""
+    """Generates a rich cyber-grid & gradient 1080x1920 background using Pillow if offline."""
     palettes = [
-        ((15, 23, 42), (30, 58, 138)),
-        ((17, 24, 39), (88, 28, 135)),
-        ((9, 25, 45), (13, 148, 136)),
-        ((24, 24, 27), (153, 27, 27)),
-        ((20, 20, 35), (67, 56, 202)),
+        ((10, 15, 35), (30, 64, 175), (56, 189, 248)),
+        ((17, 12, 38), (107, 33, 168), (244, 114, 182)),
+        ((8, 28, 36), (15, 118, 110), (45, 212, 191)),
+        ((28, 14, 24), (153, 27, 27), (251, 146, 60)),
+        ((14, 18, 42), (67, 56, 202), (167, 139, 250)),
     ]
-    top_rgb, bot_rgb = palettes[scene_idx % len(palettes)]
+    top_rgb, bot_rgb, glow_rgb = palettes[scene_idx % len(palettes)]
     width, height = 1080, 1920
     img = Image.new("RGB", (width, height))
     draw = ImageDraw.Draw(img)
@@ -499,11 +558,17 @@ def create_fallback_background(out_path: Path, scene_idx: int) -> None:
         g = int(top_rgb[1] * (1 - ratio) + bot_rgb[1] * ratio)
         b = int(top_rgb[2] * (1 - ratio) + bot_rgb[2] * ratio)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+    for gx in range(0, width, 90):
+        draw.line([(gx, 0), (gx, height)], fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2]), width=1)
+    for gy in range(0, height, 90):
+        draw.line([(0, gy), (width, gy)], fill=(glow_rgb[0], glow_rgb[1], glow_rgb[2]), width=1)
+
     img.save(out_path, "PNG")
 
 
 # ---------------------------------------------------------------------------
-# Stage 4B: Pillow Caption Overlay & FFmpeg 1080x1920 Renderer
+# Stage 4B: Kinetic Word-by-Word Caption, Waveform & HUD Overlay Engine
 # ---------------------------------------------------------------------------
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -519,93 +584,288 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def render_caption_overlay_png(
+@dataclass
+class CaptionEvent:
+    phrase_words: List[str]
+    active_index: int
+    start_sec: float
+    duration_sec: float
+    step_seed: int
+
+
+def build_word_by_word_events(
+    word_timings: List[WordTiming],
+    target_scene_duration: float,
+    words_per_phrase: int = 4,
+) -> List[CaptionEvent]:
+    """
+    Groups words into 4-word phrases and emits one CaptionEvent per spoken word
+    so the active word highlight & waveform animate continuously every ~0.25s.
+    """
+    if not word_timings:
+        return [
+            CaptionEvent(
+                phrase_words=[""],
+                active_index=0,
+                start_sec=0.0,
+                duration_sec=target_scene_duration,
+                step_seed=0,
+            )
+        ]
+
+    events: List[CaptionEvent] = []
+    n_words = len(word_timings)
+
+    for idx, wt in enumerate(word_timings):
+        group_start = (idx // words_per_phrase) * words_per_phrase
+        group_slice = word_timings[group_start : group_start + words_per_phrase]
+        phrase_words = [w.word for w in group_slice]
+        active_idx = idx - group_start
+
+        start_s = 0.0 if idx == 0 else wt.start_sec
+        if idx + 1 < n_words:
+            end_s = max(word_timings[idx + 1].start_sec, start_s + 0.08)
+        else:
+            end_s = max(target_scene_duration, start_s + 0.15)
+
+        dur_s = max(end_s - start_s, 0.08)
+        events.append(
+            CaptionEvent(
+                phrase_words=phrase_words,
+                active_index=active_idx,
+                start_sec=start_s,
+                duration_sec=dur_s,
+                step_seed=idx,
+            )
+        )
+
+    total_ev = sum(e.duration_sec for e in events)
+    if total_ev > 0:
+        scale = target_scene_duration / total_ev
+        for e in events:
+            e.duration_sec = max(e.duration_sec * scale, 0.06)
+
+    return events
+
+
+def render_kinetic_overlay_png(
     headline: str,
-    narration_chunk: str,
+    event: CaptionEvent,
     trend_badge: str,
+    scene_idx: int,
+    total_scenes: int,
+    global_progress: float,
+    is_scene_intro: bool,
     out_png: Path,
 ) -> None:
-    """Renders a transparent 1080x1920 PNG overlay with a top trend pill, headline banner, and bottom captions."""
+    """Renders a 1080x1920 RGBA overlay frame with karaoke word pills, waveform bars, HUD, and progress bar."""
     width, height = 1080, 1920
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # Subtle bottom and top vignette gradients for legibility
-    for y in range(0, 380):
-        alpha = int(150 * (1 - y / 380))
+    for y in range(0, 420):
+        alpha = int(165 * (1 - y / 420))
         draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
-    for y in range(height - 650, height):
-        alpha = int(195 * ((y - (height - 650)) / 650))
+    for y in range(height - 720, height):
+        alpha = int(210 * ((y - (height - 720)) / 720))
         draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
 
-    font_badge = _load_font(30)
-    font_headline = _load_font(52)
-    font_sub = _load_font(44)
+    font_hud = _load_font(28)
+    font_headline = _load_font(50)
+    font_word_idle = _load_font(54)
+    font_word_active = _load_font(62)
 
-    # 1. Top Trend Badge
-    badge_text = f"TRENDING: {trend_badge.upper()[:34]}"
-    bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
-    bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    bx = (width - bw) // 2
-    by = 140
+    # --- 1. Top HUD: Live Pulse + Trend Pill + Scene Counter ---
+    hud_y = 125
+    counter_str = f"SCENE {scene_idx + 1:02d}/{total_scenes:02d}"
+    cb = draw.textbbox((0, 0), counter_str, font=font_hud)
+    cw, ch = cb[2] - cb[0], cb[3] - cb[1]
+    cx = width - cw - 75
     draw.rounded_rectangle(
-        [bx - 28, by - 14, bx + bw + 28, by + bh + 18],
-        radius=24,
-        fill=(220, 38, 38, 230),
+        [cx - 20, hud_y - 12, cx + cw + 20, hud_y + ch + 14],
+        radius=20,
+        fill=(15, 23, 42, 220),
+        outline=(56, 189, 248, 220),
+        width=2,
     )
-    draw.text((bx, by), badge_text, font=font_badge, fill=(255, 255, 255, 255))
+    draw.text((cx, hud_y), counter_str, font=font_hud, fill=(56, 189, 248, 255))
 
-    # 2. Upper-Middle Headline Banner
+    badge_text = f"LIVE TREND: {trend_badge.upper()[:24]}"
+    bb = draw.textbbox((0, 0), badge_text, font=font_hud)
+    bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+    bx = 75
+    draw.rounded_rectangle(
+        [bx - 22, hud_y - 12, bx + bw + 52, hud_y + bh + 14],
+        radius=20,
+        fill=(220, 38, 38, 235),
+    )
+    pulse_r = 9 if (event.step_seed % 2 == 0) else 6
+    dot_cx, dot_cy = bx + 6, hud_y + bh // 2 + 2
+    draw.ellipse(
+        [dot_cx - pulse_r, dot_cy - pulse_r, dot_cx + pulse_r, dot_cy + pulse_r],
+        fill=(255, 255, 255, 255),
+    )
+    draw.text((bx + 26, hud_y), badge_text, font=font_hud, fill=(255, 255, 255, 255))
+
+    # --- 2. Animated Headline Banner ---
+    slide_offset_y = -22 if is_scene_intro else 0
     wrapped_head = textwrap.wrap(headline.upper(), width=20)[:2]
-    hy = 240
+    hy = 235 + slide_offset_y
+
+    card_h = len(wrapped_head) * 68 + 32
+    draw.rounded_rectangle(
+        [65, hy - 18, width - 65, hy + card_h - 18],
+        radius=22,
+        fill=(15, 23, 42, 190),
+        outline=(250, 204, 21, 210),
+        width=3,
+    )
     for line in wrapped_head:
         lb = draw.textbbox((0, 0), line, font=font_headline)
         lw, lh = lb[2] - lb[0], lb[3] - lb[1]
         lx = (width - lw) // 2
-        draw.text((lx + 3, hy + 3), line, font=font_headline, fill=(0, 0, 0, 220))
+        draw.text((lx + 3, hy + 3), line, font=font_headline, fill=(0, 0, 0, 230))
         draw.text((lx, hy), line, font=font_headline, fill=(250, 204, 21, 255))
-        hy += lh + 16
+        hy += lh + 18
 
-    # 3. Lower-Third Narration Captions
-    wrapped_sub = textwrap.wrap(narration_chunk, width=26)[:4]
-    sy = height - 470
-    for line in wrapped_sub:
-        lb = draw.textbbox((0, 0), line, font=font_sub)
-        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        lx = (width - lw) // 2
-        draw.rounded_rectangle(
-            [lx - 20, sy - 8, lx + lw + 20, sy + lh + 14],
-            radius=14,
-            fill=(15, 23, 42, 205),
-        )
-        draw.text((lx, sy), line, font=font_sub, fill=(255, 255, 255, 255))
-        sy += lh + 28
+    # --- 3. Dynamic Audio Equalizer Bars ---
+    num_bars = 21
+    bar_w = 12
+    bar_gap = 10
+    total_eq_w = num_bars * bar_w + (num_bars - 1) * bar_gap
+    eq_start_x = (width - total_eq_w) // 2
+    eq_base_y = height - 540
+
+    for b_idx in range(num_bars):
+        wave = abs(math.sin((b_idx * 0.65) + (event.step_seed * 1.35)))
+        center_boost = 1.0 - abs(b_idx - num_bars // 2) / (num_bars / 1.5)
+        bar_h = int(14 + 54 * wave * max(center_boost, 0.35))
+        bx0 = eq_start_x + b_idx * (bar_w + bar_gap)
+        by0 = eq_base_y - bar_h // 2
+        by1 = eq_base_y + bar_h // 2
+        bar_color = (56, 189, 248, 235) if (b_idx % 2 == 0) else (250, 204, 21, 235)
+        draw.rounded_rectangle([bx0, by0, bx0 + bar_w, by1], radius=6, fill=bar_color)
+
+    # --- 4. Word-by-Word Karaoke Captions (Active Word Pop-Scale Pill) ---
+    words_upper = [w.upper() for w in event.phrase_words if w]
+    if not words_upper:
+        words_upper = [""]
+
+    lines_indices: List[List[int]] = []
+    if len(words_upper) <= 2:
+        lines_indices.append(list(range(len(words_upper))))
+    else:
+        mid = (len(words_upper) + 1) // 2
+        lines_indices.append(list(range(0, mid)))
+        lines_indices.append(list(range(mid, len(words_upper))))
+
+    cap_y = height - 455
+    for line_word_idxs in lines_indices:
+        word_boxes = []
+        total_line_w = 0
+        for w_i in line_word_idxs:
+            w_str = words_upper[w_i]
+            is_active = w_i == event.active_index
+            fnt = font_word_active if is_active else font_word_idle
+            wb = draw.textbbox((0, 0), w_str, font=fnt)
+            ww, wh = wb[2] - wb[0], wb[3] - wb[1]
+            word_boxes.append((w_i, w_str, is_active, fnt, ww, wh))
+            total_line_w += ww
+        total_line_w += max(len(word_boxes) - 1, 0) * 28
+
+        cursor_x = (width - total_line_w) // 2
+        for w_i, w_str, is_active, fnt, ww, wh in word_boxes:
+            if is_active and w_str:
+                pill_color = (250, 204, 21, 255) if (scene_idx % 2 == 0) else (56, 189, 248, 255)
+                text_color = (10, 15, 30, 255)
+                draw.rounded_rectangle(
+                    [cursor_x - 16, cap_y - 10, cursor_x + ww + 16, cap_y + wh + 16],
+                    radius=16,
+                    fill=pill_color,
+                    outline=(255, 255, 255, 255),
+                    width=3,
+                )
+                draw.text((cursor_x, cap_y - 2), w_str, font=fnt, fill=text_color)
+            else:
+                for dx, dy in [(-3, -3), (3, -3), (-3, 3), (3, 3), (0, 4)]:
+                    draw.text((cursor_x + dx, cap_y + dy), w_str, font=fnt, fill=(0, 0, 0, 240))
+                draw.text((cursor_x, cap_y), w_str, font=fnt, fill=(255, 255, 255, 255))
+            cursor_x += ww + 28
+        cap_y += 92
+
+    # --- 5. Continuous Bottom Timeline Progress Bar ---
+    bar_margin = 70
+    bar_y = height - 135
+    bar_total_w = width - 2 * bar_margin
+    draw.rounded_rectangle(
+        [bar_margin, bar_y, bar_margin + bar_total_w, bar_y + 14],
+        radius=7,
+        fill=(255, 255, 255, 65),
+    )
+    fill_w = max(int(bar_total_w * min(max(global_progress, 0.02), 1.0)), 16)
+    draw.rounded_rectangle(
+        [bar_margin, bar_y, bar_margin + fill_w, bar_y + 14],
+        radius=7,
+        fill=(250, 204, 21, 255),
+    )
 
     overlay.save(out_png, "PNG")
 
 
-def split_narration_into_chunks(narration: str, max_words: int = 8) -> List[str]:
-    words = narration.split()
-    if not words:
-        return [""]
-    return [" ".join(words[i : i + max_words]) for i in range(0, len(words), max_words)]
+# ---------------------------------------------------------------------------
+# Stage 4C: 30fps Ken Burns Camera Motion + Scene Transition Compositor
+# ---------------------------------------------------------------------------
+
+def get_camera_motion_filter(scene_idx: int, duration: float, is_video: bool) -> str:
+    """
+    Returns an FFmpeg video filter chain that applies continuous 30fps Ken Burns
+    pan/zoom motion, color-contrast punch, and smooth scene fade-in/out transitions.
+    """
+    fade_out_st = max(duration - 0.20, 0.1)
+    mode = scene_idx % 4
+
+    dur_safe = max(duration, 1.0)
+    if mode == 0:
+        x_expr = f"(iw-1080)*min(t/{dur_safe:.2f},1.0)"
+        y_expr = f"(ih-1920)*min(t/{dur_safe:.2f},1.0)"
+    elif mode == 1:
+        x_expr = f"(iw-1080)*(1.0-min(t/{dur_safe:.2f},1.0))"
+        y_expr = f"(ih-1920)*(0.8-0.6*min(t/{dur_safe:.2f},1.0))"
+    elif mode == 2:
+        x_expr = f"(iw-1080)*(0.5+0.45*sin(t*1.2))"
+        y_expr = f"(ih-1920)*min(t/{dur_safe:.2f},1.0)"
+    else:
+        x_expr = f"(iw-1080)/2"
+        y_expr = f"(ih-1920)*(1.0-min(t/{dur_safe:.2f},1.0))"
+
+    return (
+        f"scale=1350:2400:force_original_aspect_ratio=increase,"
+        f"crop=1350:2400,"
+        f"fps=30,"
+        f"crop=1080:1920:x='{x_expr}':y='{y_expr}',"
+        f"eq=contrast=1.06:saturation=1.12,"
+        f"fade=t=in:st=0:d=0.18,"
+        f"fade=t=out:st={fade_out_st:.2f}:d=0.18,"
+        f"format=yuv420p"
+    )
 
 
 def render_scene_clip(
     scene_idx: int,
+    total_scenes: int,
     scene: SceneSpec,
     trend_topic: str,
     audio_path: Path,
+    word_timings: List[WordTiming],
     target_scene_duration: float,
+    elapsed_before_scene: float,
+    total_video_duration: float,
     config: BotConfig,
     work_dir: Path,
 ) -> Path:
-    """Renders a single scene into a 1080x1920 30fps H.264 MP4 synced to target_scene_duration."""
+    """Renders a single scene into a 1080x1920 30fps H.264 MP4 with camera motion and karaoke captions."""
     padded_audio = work_dir / f"scene_{scene_idx:02d}_padded.mp3"
     pad_audio_with_silence(audio_path, target_scene_duration, padded_audio)
-
-    chunks = split_narration_into_chunks(scene.narration, max_words=8)
-    chunk_duration = target_scene_duration / len(chunks)
 
     bg_video_path = work_dir / f"scene_{scene_idx:02d}_raw.mp4"
     bg_image_path = work_dir / f"scene_{scene_idx:02d}_bg.png"
@@ -623,88 +883,67 @@ def render_scene_clip(
         if not got_img:
             create_fallback_background(bg_image_path, scene_idx)
 
-    subclip_paths: List[Path] = []
-    for c_idx, chunk_text in enumerate(chunks):
-        overlay_png = work_dir / f"scene_{scene_idx:02d}_ov_{c_idx:02d}.png"
-        render_caption_overlay_png(scene.overlay_text, chunk_text, trend_topic, overlay_png)
-        sub_out = work_dir / f"scene_{scene_idx:02d}_sub_{c_idx:02d}.mp4"
+    events = build_word_by_word_events(word_timings, target_scene_duration, words_per_phrase=4)
+    ov_concat_lines: List[str] = []
+    elapsed_in_scene = 0.0
 
-        if got_video:
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-stream_loop",
-                "-1",
-                "-ss",
-                f"{c_idx * chunk_duration:.2f}",
-                "-t",
-                f"{chunk_duration:.3f}",
-                "-i",
-                str(bg_video_path),
-                "-i",
-                str(overlay_png),
-                "-filter_complex",
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p[bg];"
-                "[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]",
-                "-map",
-                "[v]",
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                str(sub_out),
-            ]
-        else:
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-loop",
-                "1",
-                "-t",
-                f"{chunk_duration:.3f}",
-                "-i",
-                str(bg_image_path),
-                "-i",
-                str(overlay_png),
-                "-filter_complex",
-                "[0:v]scale=1140:2026:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p[bg];"
-                "[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]",
-                "-map",
-                "[v]",
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                str(sub_out),
-            ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        subclip_paths.append(sub_out)
+    for ev_idx, ev in enumerate(events):
+        ov_png = work_dir / f"scene_{scene_idx:02d}_ov_{ev_idx:03d}.png"
+        global_prog = (elapsed_before_scene + elapsed_in_scene) / max(total_video_duration, 1.0)
+        render_kinetic_overlay_png(
+            headline=scene.overlay_text,
+            event=ev,
+            trend_badge=trend_topic,
+            scene_idx=scene_idx,
+            total_scenes=total_scenes,
+            global_progress=global_prog,
+            is_scene_intro=(ev_idx == 0),
+            out_png=ov_png,
+        )
+        ov_concat_lines.append(f"file '{ov_png.resolve().as_posix()}'")
+        ov_concat_lines.append(f"duration {ev.duration_sec:.4f}")
+        elapsed_in_scene += ev.duration_sec
 
-    concat_list = work_dir / f"scene_{scene_idx:02d}_subs.txt"
-    concat_list.write_text(
-        "\n".join(f"file '{p.resolve().as_posix()}'" for p in subclip_paths),
-        encoding="utf-8",
-    )
+    last_png = work_dir / f"scene_{scene_idx:02d}_ov_{len(events) - 1:03d}.png"
+    ov_concat_lines.append(f"file '{last_png.resolve().as_posix()}'")
+
+    ov_concat_file = work_dir / f"scene_{scene_idx:02d}_ov_list.txt"
+    ov_concat_file.write_text("\n".join(ov_concat_lines), encoding="utf-8")
+
+    cam_filter = get_camera_motion_filter(scene_idx, target_scene_duration, is_video=got_video)
     scene_final = work_dir / f"scene_{scene_idx:02d}_final.mp4"
-    mux_cmd = [
+
+    if got_video:
+        bg_input_args = ["-stream_loop", "-1", "-t", f"{target_scene_duration:.3f}", "-i", str(bg_video_path)]
+    else:
+        bg_input_args = ["-loop", "1", "-framerate", "30", "-t", f"{target_scene_duration:.3f}", "-i", str(bg_image_path)]
+
+    cmd = [
         "ffmpeg",
         "-y",
+        *bg_input_args,
         "-f",
         "concat",
         "-safe",
         "0",
         "-i",
-        str(concat_list),
+        str(ov_concat_file),
         "-i",
         str(padded_audio),
+        "-filter_complex",
+        f"[0:v]{cam_filter}[bg];[1:v]fps=30,format=rgba[ov];[bg][ov]overlay=0:0:shortest=1,format=yuv420p[v]",
+        "-map",
+        "[v]",
+        "-map",
+        "2:a",
+        "-t",
+        f"{target_scene_duration:.3f}",
         "-c:v",
-        "copy",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
         "-c:a",
         "aac",
         "-b:a",
@@ -712,19 +951,20 @@ def render_scene_clip(
         "-shortest",
         str(scene_final),
     ]
-    subprocess.run(mux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return scene_final
 
 
 def assemble_full_reel(
     script: ReelScript,
     audio_paths: List[Path],
+    all_word_timings: List[List[WordTiming]],
     config: BotConfig,
     work_dir: Path,
 ) -> Path:
     """
-    Renders all scenes and guarantees the final 1080x1920 MP4 is at least `config.min_video_seconds`
-    (default 125s / >2 minutes) while staying safely below `config.max_video_seconds` (175s / <3 minutes).
+    Renders all scenes with kinetic animations and guarantees the final 1080x1920 MP4
+    is at least `config.min_video_seconds` (125s / >2 minutes) and under `config.max_video_seconds` (175s).
     """
     raw_durations = [get_media_duration(p) + 0.45 for p in audio_paths]
     total_raw = sum(raw_durations)
@@ -739,18 +979,39 @@ def assemble_full_reel(
             config.min_video_seconds,
         )
 
+    target_durations = [d + extra_per_scene for d in raw_durations]
+    total_planned = sum(target_durations)
+
     scene_clips: List[Path] = []
-    for idx, (scene, audio_path, base_dur) in enumerate(zip(script.scenes, audio_paths, raw_durations)):
-        target_dur = base_dur + extra_per_scene
+    elapsed_so_far = 0.0
+    total_scenes = len(script.scenes)
+
+    for idx, (scene, audio_path, w_timings, target_dur) in enumerate(
+        zip(script.scenes, audio_paths, all_word_timings, target_durations)
+    ):
         logger.info(
-            "Rendering scene %d/%d ('%s', %.1fs)...",
+            "Rendering animated scene %d/%d ('%s', %d words, %.1fs)...",
             idx + 1,
-            len(script.scenes),
+            total_scenes,
             scene.overlay_text,
+            len(w_timings),
             target_dur,
         )
-        clip = render_scene_clip(idx, scene, script.trend_topic, audio_path, target_dur, config, work_dir)
+        clip = render_scene_clip(
+            scene_idx=idx,
+            total_scenes=total_scenes,
+            scene=scene,
+            trend_topic=script.trend_topic,
+            audio_path=audio_path,
+            word_timings=w_timings,
+            target_scene_duration=target_dur,
+            elapsed_before_scene=elapsed_so_far,
+            total_video_duration=total_planned,
+            config=config,
+            work_dir=work_dir,
+        )
         scene_clips.append(clip)
+        elapsed_so_far += target_dur
 
     concat_file = work_dir / "all_scenes.txt"
     concat_file.write_text(
@@ -790,96 +1051,12 @@ def assemble_full_reel(
         str(final_mp4),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    logger.info("Final vertical Reel/Short saved to %s (%.1fs)", final_mp4, get_media_duration(final_mp4))
+    logger.info("Final animated Instagram Reel saved to %s (%.1fs)", final_mp4, get_media_duration(final_mp4))
     return final_mp4
 
 
 # ---------------------------------------------------------------------------
-# Stage 5A: YouTube Shorts Automated Uploader (YouTube Data API v3)
-# ---------------------------------------------------------------------------
-
-def upload_to_youtube_shorts(video_path: Path, script: ReelScript, config: BotConfig) -> Optional[str]:
-    """Uploads the vertical MP4 (up to 3 mins) to YouTube Shorts using an OAuth 2.0 Refresh Token."""
-    if not (config.yt_client_id and config.yt_client_secret and config.yt_refresh_token):
-        logger.warning("YouTube credentials not fully configured; skipping YouTube Shorts upload.")
-        return None
-
-    from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-
-    creds = Credentials(
-        token=None,
-        refresh_token=config.yt_refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=config.yt_client_id,
-        client_secret=config.yt_client_secret,
-        scopes=["https://www.googleapis.com/auth/youtube.upload"],
-    )
-
-    youtube = build("youtube", "v3", credentials=creds)
-
-    body = {
-        "snippet": {
-            "title": script.title[:100],
-            "description": f"{script.caption}\n\n#Shorts #Trending",
-            "tags": script.tags[:15],
-            "categoryId": "28",  # 28 = Science & Tech (use 25 for News, 22 for People & Blogs)
-        },
-        "status": {
-            "privacyStatus": config.yt_privacy_status,
-            "selfDeclaredMadeForKids": False,
-        },
-    }
-
-    media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True, chunksize=4 * 1024 * 1024)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-
-    logger.info("Uploading '%s' to YouTube Shorts...", script.title)
-    response = None
-    while response is None:
-        _, response = request.next_chunk()
-
-    video_id = response.get("id")
-    short_url = f"https://www.youtube.com/shorts/{video_id}"
-    logger.info("Published to YouTube Shorts: %s", short_url)
-    return short_url
-
-
-def interactive_youtube_oauth_setup() -> None:
-    """One-time local helper to generate YOUTUBE_REFRESH_TOKEN from a Google Cloud client_secret.json."""
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    secret_path = Path("client_secret.json")
-    if not secret_path.exists():
-        print(
-            "Error: Place your downloaded OAuth Desktop 'client_secret.json' in the current directory first.\n"
-            "Get it from Google Cloud Console -> APIs & Services -> Credentials -> Create OAuth Client ID (Desktop App)."
-        )
-        sys.exit(1)
-
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(secret_path),
-        scopes=["https://www.googleapis.com/auth/youtube.upload"],
-    )
-    creds = flow.run_local_server(port=8080, access_type="offline", prompt="consent")
-    print("\n=== Add these 3 secrets to your GitHub Repository Secrets ===")
-    print(f"YOUTUBE_CLIENT_ID={creds.client_id}")
-    print(f"YOUTUBE_CLIENT_SECRET={creds.client_secret}")
-    print(f"YOUTUBE_REFRESH_TOKEN={creds.refresh_token}\n")
-
-    env_path = Path(".env")
-    if env_path.exists():
-        content = env_path.read_text(encoding="utf-8")
-        content = re.sub(r"^YOUTUBE_CLIENT_ID=.*", f"YOUTUBE_CLIENT_ID={creds.client_id}", content, flags=re.MULTILINE)
-        content = re.sub(r"^YOUTUBE_CLIENT_SECRET=.*", f"YOUTUBE_CLIENT_SECRET={creds.client_secret}", content, flags=re.MULTILINE)
-        content = re.sub(r"^YOUTUBE_REFRESH_TOKEN=.*", f"YOUTUBE_REFRESH_TOKEN={creds.refresh_token}", content, flags=re.MULTILINE)
-        env_path.write_text(content, encoding="utf-8")
-        print("Updated .env with YouTube credentials successfully!")
-
-
-# ---------------------------------------------------------------------------
-# Stage 5B: Instagram Reels Automated Uploader (Meta Graph API + instagrapi)
+# Stage 5: Instagram Reels Automated Uploader (Meta Graph API + instagrapi)
 # ---------------------------------------------------------------------------
 
 def upload_to_instagram_graph_api(video_path: Path, script: ReelScript, config: BotConfig) -> Optional[str]:
@@ -958,6 +1135,20 @@ def upload_to_instagram_instagrapi(video_path: Path, script: ReelScript, config:
     return str(media.pk)
 
 
+def interactive_ig_session_setup() -> None:
+    """One-time local helper to log into Instagram via instagrapi and export IG_SESSION_JSON for GitHub Secrets."""
+    from instagrapi import Client
+
+    config = BotConfig()
+    username = config.ig_username or input("Enter your Instagram username: ").strip()
+    password = config.ig_password or input("Enter your Instagram password: ").strip()
+    cl = Client()
+    cl.login(username, password)
+    session_str = json.dumps(cl.get_settings())
+    print("\n=== Add this secret to your .env and GitHub Repository Secrets ===")
+    print(f"IG_SESSION_JSON='{session_str}'\n")
+
+
 def upload_to_instagram_reels(video_path: Path, script: ReelScript, config: BotConfig) -> Optional[str]:
     if config.ig_user_id and config.ig_access_token:
         return upload_to_instagram_graph_api(video_path, script, config)
@@ -978,17 +1169,19 @@ def run_pipeline(dry_run: bool = False) -> Path:
     logger.info("Step 1/5: Fetching live trending topics (GEO=%s)...", config.trend_geo)
     trends = fetch_trending_topics(geo=config.trend_geo)
 
-    logger.info("Step 2/5: Generating 2+ minute script with Gemini (%s)...", config.gemini_model)
+    logger.info("Step 2/5: Generating 2+ minute Instagram Reel script with Gemini (%s)...", config.gemini_model)
     script = generate_reel_script(config, trends, past_topics)
 
     with tempfile.TemporaryDirectory(prefix="reel_bot_") as tmp_str:
         work_dir = Path(tmp_str)
 
-        logger.info("Step 3/5: Synthesizing neural voiceover via edge-tts (%s)...", config.tts_voice)
-        audio_paths = generate_scene_voiceovers(script.scenes, config.tts_voice, config.tts_rate, work_dir)
+        logger.info("Step 3/5: Synthesizing neural voiceover & word timings via edge-tts (%s)...", config.tts_voice)
+        audio_paths, all_word_timings = generate_scene_voiceovers(
+            script.scenes, config.tts_voice, config.tts_rate, work_dir
+        )
 
-        logger.info("Step 4/5: Fetching visuals & rendering 1080x1920 vertical video (>=%ds)...", config.min_video_seconds)
-        final_video = assemble_full_reel(script, audio_paths, config, work_dir)
+        logger.info("Step 4/5: Rendering kinetic 1080x1920 vertical Reel (>=%ds)...", config.min_video_seconds)
+        final_video = assemble_full_reel(script, audio_paths, all_word_timings, config, work_dir)
 
     meta_path = final_video.with_suffix(".json")
     meta_path.write_text(
@@ -1008,30 +1201,29 @@ def run_pipeline(dry_run: bool = False) -> Path:
     )
 
     if dry_run:
-        logger.info("Dry-run enabled: skipping YouTube & Instagram uploads.")
+        logger.info("Dry-run enabled: skipping Instagram Reels upload.")
         return final_video
 
-    logger.info("Step 5/5: Publishing to YouTube Shorts and Instagram Reels...")
-    yt_url = upload_to_youtube_shorts(final_video, script, config)
+    logger.info("Step 5/5: Publishing to Instagram Reels...")
     ig_id = upload_to_instagram_reels(final_video, script, config)
 
     save_topic_history(config.history_file, script.trend_topic)
-    logger.info("Pipeline complete! YouTube=%s | Instagram=%s", yt_url, ig_id)
+    logger.info("Pipeline complete! Instagram Reel ID=%s", ig_id)
     return final_video
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Autonomous Daily Trend-to-Reel & YouTube Shorts Bot (2+ Min Edition)")
+    parser = argparse.ArgumentParser(description="Autonomous Daily Trend-to-Instagram Reels Bot (Kinetic Edition)")
     parser.add_argument("--dry-run", action="store_true", help="Generate video locally without uploading")
     parser.add_argument(
-        "--setup-youtube",
+        "--setup-ig-session",
         action="store_true",
-        help="Run interactive OAuth flow locally to print YOUTUBE_REFRESH_TOKEN",
+        help="Log in once locally via instagrapi to export IG_SESSION_JSON for GitHub Actions",
     )
     args = parser.parse_args()
 
-    if args.setup_youtube:
-        interactive_youtube_oauth_setup()
+    if args.setup_ig_session:
+        interactive_ig_session_setup()
         return
 
     run_pipeline(dry_run=args.dry_run)
