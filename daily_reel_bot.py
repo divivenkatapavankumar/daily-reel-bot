@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import math
@@ -128,7 +129,12 @@ class BotConfig:
     ig_access_token: str = field(default_factory=lambda: os.getenv("IG_ACCESS_TOKEN", "").strip())
     ig_username: str = field(default_factory=lambda: os.getenv("IG_USERNAME", "").strip())
     ig_password: str = field(default_factory=lambda: os.getenv("IG_PASSWORD", "").strip())
-    ig_session_json: str = field(default_factory=lambda: os.getenv("IG_SESSION_JSON", "").strip())
+    ig_session_json: str = field(
+        default_factory=lambda: (
+            os.getenv("IG_SESSION_JSON", "").strip()
+            or (Path("ig_session.json").read_text(encoding="utf-8").strip() if Path("ig_session.json").is_file() else "")
+        )
+    )
 
     output_dir: Path = field(default_factory=lambda: Path(os.getenv("OUTPUT_DIR", "output")))
     history_file: Path = field(default_factory=lambda: Path(os.getenv("HISTORY_FILE", "topic_history.json")))
@@ -147,6 +153,7 @@ class SceneSpec:
     overlay_text: str
     search_query: str
     image_prompt: str
+    search_queries: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -302,6 +309,10 @@ Task:
     {{
       "narration": "2 to 3 full, engaging spoken sentences (MUST be 25-30 words per scene, natural spoken English, no emojis or hashtags).",
       "overlay_text": "3-5 WORD PUNCHY HEADLINE",
+      "search_queries": [
+        "2-3 word keyword for primary visual photograph (e.g. 'stock exchange trading')",
+        "2-3 word keyword for secondary cutaway photo (e.g. 'vault cash money')"
+      ],
       "search_query": "2-3 word stock video keyword for Pexels (e.g. 'server room technology')",
       "image_prompt": "Vertical 9:16 cinematic illustration/photo prompt describing the visual scene, clean composition, no text, no watermarks"
     }}
@@ -358,8 +369,10 @@ Expand this script to **13 to 15 scenes** with **26 to 32 spoken words per scene
         SceneSpec(
             narration=s["narration"].strip(),
             overlay_text=s["overlay_text"].strip(),
-            search_query=s["search_query"].strip(),
-            image_prompt=s["image_prompt"].strip(),
+            search_query=s.get("search_query", "").strip(),
+            image_prompt=s.get("image_prompt", "").strip(),
+            search_queries=[str(q).strip() for q in s.get("search_queries", []) if str(q).strip()]
+            or [s.get("search_query", "").strip()],
         )
         for s in payload["scenes"]
     ]
@@ -491,7 +504,7 @@ def pad_audio_with_silence(in_mp3: Path, target_duration: float, out_mp3: Path) 
 
 
 # ---------------------------------------------------------------------------
-# Stage 4A: Free Visual Fetching (Pexels Stock Video + Pollinations AI + Fallback)
+# Stage 4A: Multi-Provider Visual Pipeline (Pexels, Wikimedia, Pollinations, Picsum)
 # ---------------------------------------------------------------------------
 
 def fetch_pexels_vertical_video(query: str, api_key: str, out_path: Path) -> bool:
@@ -524,19 +537,144 @@ def fetch_pexels_vertical_video(query: str, api_key: str, out_path: Path) -> boo
     return False
 
 
+def fetch_pexels_vertical_photo(query: str, api_key: str, out_path: Path) -> bool:
+    """Downloads a portrait 9:16 HD stock photo from Pexels API if available."""
+    if not api_key:
+        return False
+    url = "https://api.pexels.com/v1/search"
+    params = {"query": query, "orientation": "portrait", "per_page": 5}
+    headers = {"Authorization": api_key}
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
+        resp.raise_for_status()
+        photos = resp.json().get("photos", [])
+        if photos:
+            src = photos[0].get("src", {})
+            img_url = src.get("large2x") or src.get("large") or src.get("original")
+            if img_url:
+                img_resp = requests.get(img_url, timeout=20)
+                if img_resp.status_code == 200 and len(img_resp.content) > 15_000:
+                    with Image.open(io.BytesIO(img_resp.content)) as im:
+                        im.convert("RGB").save(out_path, "PNG")
+                    logger.info("Downloaded Pexels portrait photo for '%s'", query)
+                    return True
+    except Exception as exc:
+        logger.debug("Pexels photo lookup failed for '%s': %s", query, exc)
+    return False
+
+
+def fetch_wikimedia_image(query: str, out_path: Path) -> bool:
+    """Downloads a free high-resolution photograph from Wikimedia Commons (zero API key needed)."""
+    clean_q = re.sub(r"[^\w\s-]", " ", query).strip()
+    if not clean_q:
+        return False
+    url = "https://commons.wikimedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": f"{clean_q} filetype:bitmap",
+        "gsrnamespace": 6,
+        "gsrlimit": 8,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|size",
+        "iiurlwidth": 1280,
+        "format": "json",
+    }
+    headers = {"User-Agent": "DailyReelBot/2.0 (contact@dailyreelbot.local)"}
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
+        if resp.status_code != 200:
+            return False
+        pages = resp.json().get("query", {}).get("pages", {})
+        for pid, pdata in pages.items():
+            ii = pdata.get("imageinfo", [{}])[0]
+            thumburl = ii.get("thumburl") or ii.get("url")
+            mime = ii.get("mime", "")
+            if thumburl and mime in ("image/jpeg", "image/png", "image/webp"):
+                img_resp = requests.get(thumburl, headers=headers, timeout=8)
+                if img_resp.status_code == 200 and len(img_resp.content) > 15_000:
+                    with Image.open(io.BytesIO(img_resp.content)) as im:
+                        if im.width >= 350 and im.height >= 350:
+                            im.convert("RGB").save(out_path, "PNG")
+                            logger.info("Downloaded Wikimedia photo for '%s' (%dx%d)", clean_q, im.width, im.height)
+                            return True
+    except Exception as exc:
+        logger.debug("Wikimedia search failed for '%s': %s", clean_q, exc)
+    return False
+
+
 def fetch_pollinations_vertical_image(prompt: str, seed: int, out_path: Path) -> bool:
     """Downloads a free 1080x1920 AI-generated vertical image from Pollinations.ai (no API key needed)."""
-    encoded = urllib.parse.quote(f"{prompt}, vertical 9:16 aspect ratio, cinematic lighting, high detail, no text")
+    clean_p = re.sub(r"[^\w\s-]", " ", prompt)[:85].strip()
+    encoded = urllib.parse.quote(f"{clean_p}, vertical 9:16 portrait, cinematic lighting, photorealistic, no text")
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1920&seed={seed}&nologo=true"
     try:
-        resp = requests.get(url, timeout=35)
+        resp = requests.get(url, timeout=20)
         if resp.status_code == 200 and len(resp.content) > 10_000:
-            out_path.write_bytes(resp.content)
+            with Image.open(io.BytesIO(resp.content)) as im:
+                im.convert("RGB").save(out_path, "PNG")
             logger.info("Generated 1080x1920 AI image via Pollinations.ai (seed=%d)", seed)
             return True
     except Exception as exc:
-        logger.warning("Pollinations.ai image generation failed: %s", exc)
+        logger.debug("Pollinations.ai image generation failed: %s", exc)
     return False
+
+
+def fetch_picsum_vertical_image(seed: int, out_path: Path) -> bool:
+    """Downloads a guaranteed high-res 1080x1920 aesthetic photo from Picsum (zero key needed, 100% reliable)."""
+    url = f"https://picsum.photos/1080/1920?random={seed}"
+    try:
+        resp = requests.get(url, timeout=12)
+        if resp.status_code == 200 and len(resp.content) > 15_000:
+            with Image.open(io.BytesIO(resp.content)) as im:
+                im.convert("RGB").save(out_path, "PNG")
+            logger.info("Fetched Picsum 1080x1920 aesthetic photography (seed=%d)", seed)
+            return True
+    except Exception as exc:
+        logger.debug("Picsum fetch failed: %s", exc)
+    return False
+
+
+def acquire_shot_visual(
+    query: str,
+    prompt: str,
+    seed: int,
+    config: BotConfig,
+    out_img: Path,
+    out_vid: Path,
+    scene_idx: int,
+    shot_idx: int,
+) -> Tuple[Path, bool]:
+    """
+    Acquires a real vertical photograph or video clip using the multi-provider priority chain:
+    1. Pexels Stock Video (if PEXELS_API_KEY provided)
+    2. Pexels HD Portrait Photo (if PEXELS_API_KEY provided)
+    3. Wikimedia Commons real topical photograph (free, keyless)
+    4. Pollinations.ai AI vertical art (free, keyless)
+    5. Picsum HD 1080x1920 aesthetic photography (free, 100% reliable fallback)
+    6. Pillow procedural cyber-grid (offline safety net)
+    """
+    if config.visual_source in ("auto", "pexels") and config.pexels_api_key:
+        if fetch_pexels_vertical_video(query, config.pexels_api_key, out_vid):
+            return out_vid, True
+        if fetch_pexels_vertical_photo(query, config.pexels_api_key, out_img):
+            return out_img, False
+
+    if config.visual_source in ("auto", "wikimedia", "photo"):
+        if fetch_wikimedia_image(query, out_img):
+            return out_img, False
+
+    if config.visual_source in ("auto", "pollinations"):
+        if fetch_pollinations_vertical_image(prompt or query, seed, out_img):
+            return out_img, False
+
+    # Guaranteed aesthetic real photography fallback
+    if fetch_picsum_vertical_image(seed, out_img):
+        return out_img, False
+
+    # Offline safety net
+    create_fallback_background(out_img, scene_idx + shot_idx)
+    return out_img, False
 
 
 def create_fallback_background(out_path: Path, scene_idx: int) -> None:
@@ -821,10 +959,20 @@ def get_camera_motion_filter(scene_idx: int, duration: float, is_video: bool) ->
     Returns an FFmpeg video filter chain that applies continuous 30fps Ken Burns
     pan/zoom motion, color-contrast punch, and smooth scene fade-in/out transitions.
     """
-    fade_out_st = max(duration - 0.20, 0.1)
-    mode = scene_idx % 4
-
+    fade_out_st = max(duration - 0.16, 0.1)
     dur_safe = max(duration, 1.0)
+    if is_video:
+        return (
+            f"scale=1080:1920:force_original_aspect_ratio=increase,"
+            f"crop=1080:1920,"
+            f"fps=30,"
+            f"eq=contrast=1.06:saturation=1.12,"
+            f"fade=t=in:st=0:d=0.15,"
+            f"fade=t=out:st={fade_out_st:.2f}:d=0.15,"
+            f"format=yuv420p"
+        )
+
+    mode = scene_idx % 4
     if mode == 0:
         x_expr = f"(iw-1080)*min(t/{dur_safe:.2f},1.0)"
         y_expr = f"(ih-1920)*min(t/{dur_safe:.2f},1.0)"
@@ -844,8 +992,8 @@ def get_camera_motion_filter(scene_idx: int, duration: float, is_video: bool) ->
         f"fps=30,"
         f"crop=1080:1920:x='{x_expr}':y='{y_expr}',"
         f"eq=contrast=1.06:saturation=1.12,"
-        f"fade=t=in:st=0:d=0.18,"
-        f"fade=t=out:st={fade_out_st:.2f}:d=0.18,"
+        f"fade=t=in:st=0:d=0.15,"
+        f"fade=t=out:st={fade_out_st:.2f}:d=0.15,"
         f"format=yuv420p"
     )
 
@@ -863,25 +1011,79 @@ def render_scene_clip(
     config: BotConfig,
     work_dir: Path,
 ) -> Path:
-    """Renders a single scene into a 1080x1920 30fps H.264 MP4 with camera motion and karaoke captions."""
+    """Renders a single scene into a 1080x1920 30fps H.264 MP4 with multi-picture dynamic camera cuts and karaoke captions."""
     padded_audio = work_dir / f"scene_{scene_idx:02d}_padded.mp3"
     pad_audio_with_silence(audio_path, target_scene_duration, padded_audio)
 
-    bg_video_path = work_dir / f"scene_{scene_idx:02d}_raw.mp4"
-    bg_image_path = work_dir / f"scene_{scene_idx:02d}_bg.png"
+    # Multi-picture shot division: 2 to 3 dynamic visual cuts per scene (every 3.5 - 5.5 seconds)
+    num_shots = 3 if target_scene_duration >= 13.0 else 2
+    dur_base = round(target_scene_duration / num_shots, 3)
+    shot_durations = [dur_base] * num_shots
+    shot_durations[-1] = round(target_scene_duration - sum(shot_durations[:-1]), 3)
 
-    got_video = False
-    if config.visual_source in ("auto", "pexels") and config.pexels_api_key:
-        got_video = fetch_pexels_vertical_video(scene.search_query, config.pexels_api_key, bg_video_path)
+    shot_mp4s: List[Path] = []
+    queries = scene.search_queries if scene.search_queries else [scene.search_query]
 
-    if not got_video:
-        got_img = False
-        if config.visual_source in ("auto", "pollinations"):
-            got_img = fetch_pollinations_vertical_image(
-                scene.image_prompt, seed=int(time.time()) + scene_idx * 97, out_path=bg_image_path
-            )
-        if not got_img:
-            create_fallback_background(bg_image_path, scene_idx)
+    for shot_idx in range(num_shots):
+        if shot_idx < len(queries) and queries[shot_idx].strip():
+            q = queries[shot_idx].strip()
+        elif shot_idx == 0:
+            q = scene.search_query or scene.overlay_text
+        else:
+            q = f"{scene.search_query} {scene.overlay_text}".strip()
+
+        shot_dur = shot_durations[shot_idx]
+        shot_img_path = work_dir / f"scene_{scene_idx:02d}_shot_{shot_idx:02d}.png"
+        shot_vid_path = work_dir / f"scene_{scene_idx:02d}_shot_{shot_idx:02d}_raw.mp4"
+        shot_mp4 = work_dir / f"scene_{scene_idx:02d}_shot_{shot_idx:02d}.mp4"
+
+        shot_asset, is_video = acquire_shot_visual(
+            query=q,
+            prompt=scene.image_prompt,
+            seed=int(time.time()) + scene_idx * 97 + shot_idx * 23,
+            config=config,
+            out_img=shot_img_path,
+            out_vid=shot_vid_path,
+            scene_idx=scene_idx,
+            shot_idx=shot_idx,
+        )
+
+        cam_filter = get_camera_motion_filter(scene_idx * 3 + shot_idx, shot_dur, is_video=is_video)
+        if is_video:
+            bg_input_args = ["-stream_loop", "-1", "-t", f"{shot_dur:.3f}", "-i", str(shot_asset)]
+        else:
+            bg_input_args = ["-loop", "1", "-framerate", "30", "-t", f"{shot_dur:.3f}", "-i", str(shot_asset)]
+
+        cmd_shot = [
+            "ffmpeg",
+            "-y",
+            *bg_input_args,
+            "-vf",
+            cam_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "22",
+            "-t",
+            f"{shot_dur:.3f}",
+            str(shot_mp4),
+        ]
+        subprocess.run(cmd_shot, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        shot_mp4s.append(shot_mp4)
+
+    shot_concat_file = work_dir / f"scene_{scene_idx:02d}_shots_list.txt"
+    shot_concat_file.write_text(
+        "\n".join(f"file '{s.resolve().as_posix()}'" for s in shot_mp4s), encoding="utf-8"
+    )
+    scene_bg_combined = work_dir / f"scene_{scene_idx:02d}_bg_combined.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(shot_concat_file), "-c", "copy", str(scene_bg_combined)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
 
     events = build_word_by_word_events(word_timings, target_scene_duration, words_per_phrase=4)
     ov_concat_lines: List[str] = []
@@ -910,18 +1112,13 @@ def render_scene_clip(
     ov_concat_file = work_dir / f"scene_{scene_idx:02d}_ov_list.txt"
     ov_concat_file.write_text("\n".join(ov_concat_lines), encoding="utf-8")
 
-    cam_filter = get_camera_motion_filter(scene_idx, target_scene_duration, is_video=got_video)
     scene_final = work_dir / f"scene_{scene_idx:02d}_final.mp4"
-
-    if got_video:
-        bg_input_args = ["-stream_loop", "-1", "-t", f"{target_scene_duration:.3f}", "-i", str(bg_video_path)]
-    else:
-        bg_input_args = ["-loop", "1", "-framerate", "30", "-t", f"{target_scene_duration:.3f}", "-i", str(bg_image_path)]
 
     cmd = [
         "ffmpeg",
         "-y",
-        *bg_input_args,
+        "-i",
+        str(scene_bg_combined),
         "-f",
         "concat",
         "-safe",
@@ -931,7 +1128,7 @@ def render_scene_clip(
         "-i",
         str(padded_audio),
         "-filter_complex",
-        f"[0:v]{cam_filter}[bg];[1:v]fps=30,format=rgba[ov];[bg][ov]overlay=0:0:shortest=1,format=yuv420p[v]",
+        "[0:v]fps=30[bg];[1:v]fps=30,format=rgba[ov];[bg][ov]overlay=0:0:shortest=1,format=yuv420p[v]",
         "-map",
         "[v]",
         "-map",
@@ -1129,8 +1326,20 @@ def upload_to_instagram_instagrapi(video_path: Path, script: ReelScript, config:
     if config.ig_session_json:
         cl.set_settings(json.loads(config.ig_session_json))
     cl.login(config.ig_username, config.ig_password)
+    thumb_path = video_path.with_suffix(".jpg")
+    if not thumb_path.exists():
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", "00:00:02", "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(thumb_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except Exception:
+            pass
+
     logger.info("Uploading Reel via instagrapi...")
-    media = cl.clip_upload(str(video_path), caption=script.caption)
+    media = cl.clip_upload(str(video_path), caption=script.caption, thumbnail=thumb_path if thumb_path.exists() else None)
     logger.info("Published to Instagram Reels via instagrapi (pk=%s)", media.pk)
     return str(media.pk)
 

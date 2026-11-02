@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 client_secret.json
+ig_session.json
 
 # Python & Virtualenv
 .venv/
