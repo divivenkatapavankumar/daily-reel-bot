@@ -899,22 +899,6 @@ def render_kinetic_overlay_png(
             cursor_x += ww + 28
         cap_y += 92
 
-    # --- 5. Continuous Bottom Timeline Progress Bar ---
-    bar_margin = 70
-    bar_y = height - 135
-    bar_total_w = width - 2 * bar_margin
-    draw.rounded_rectangle(
-        [bar_margin, bar_y, bar_margin + bar_total_w, bar_y + 14],
-        radius=7,
-        fill=(255, 255, 255, 65),
-    )
-    fill_w = max(int(bar_total_w * min(max(global_progress, 0.02), 1.0)), 16)
-    draw.rounded_rectangle(
-        [bar_margin, bar_y, bar_margin + fill_w, bar_y + 14],
-        radius=7,
-        fill=(250, 204, 21, 255),
-    )
-
     overlay.save(out_png, "PNG")
 
 
