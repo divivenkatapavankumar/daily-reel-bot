@@ -1,0 +1,89 @@
+name: Daily Autonomous Reel & Short Bot
+
+on:
+  schedule:
+    # Runs every day at 12:30 UTC (18:00 IST / 08:30 EDT)
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Generate video artifact only without uploading to YouTube/Instagram'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  generate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg and Liberation Fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-liberation
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Daily Reel & Short Pipeline (2+ Min Deep-Dive)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash' }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          TREND_GEO: ${{ vars.TREND_GEO || 'IN' }}
+          NICHE_FILTER: ${{ vars.NICHE_FILTER || 'technology, AI, science, business, finance, or fascinating world news' }}
+          TTS_VOICE: ${{ vars.TTS_VOICE || 'en-US-ChristopherNeural' }}
+          TTS_RATE: ${{ vars.TTS_RATE || '+0%' }}
+          MIN_VIDEO_SECONDS: ${{ vars.MIN_VIDEO_SECONDS || '125' }}
+          MAX_VIDEO_SECONDS: ${{ vars.MAX_VIDEO_SECONDS || '175' }}
+          VISUAL_SOURCE: ${{ vars.VISUAL_SOURCE || 'auto' }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USERNAME: ${{ secrets.IG_USERNAME }}
+          IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
+          IG_SESSION_JSON: ${{ secrets.IG_SESSION_JSON }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python daily_reel_bot.py --dry-run
+          else
+            python daily_reel_bot.py
+          fi
+
+      - name: Commit updated topic history (prevents duplicate topics)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          if [ -f topic_history.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add topic_history.json
+            git diff --staged --quiet || git commit -m "chore: update covered trend history [skip ci]"
+            git push
+          fi
+
+      - name: Upload generated MP4 & metadata as GitHub Action Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-reel-${{ github.run_number }}
+          path: output/
+          retention-days: 7
