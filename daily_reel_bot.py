@@ -801,54 +801,22 @@ def render_kinetic_overlay_png(
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    for y in range(0, 420):
-        alpha = int(165 * (1 - y / 420))
+    # Subtle top gradient to ensure headline readability without obscuring visuals
+    for y in range(0, 320):
+        alpha = int(120 * (1 - y / 320))
         draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
     for y in range(height - 720, height):
         alpha = int(210 * ((y - (height - 720)) / 720))
         draw.line([(0, y), (width, y)], fill=(0, 0, 0, alpha))
 
-    font_hud = _load_font(28)
     font_headline = _load_font(50)
     font_word_idle = _load_font(54)
     font_word_active = _load_font(62)
 
-    # --- 1. Top HUD: Live Pulse + Trend Pill + Scene Counter ---
-    hud_y = 125
-    counter_str = f"SCENE {scene_idx + 1:02d}/{total_scenes:02d}"
-    cb = draw.textbbox((0, 0), counter_str, font=font_hud)
-    cw, ch = cb[2] - cb[0], cb[3] - cb[1]
-    cx = width - cw - 75
-    draw.rounded_rectangle(
-        [cx - 20, hud_y - 12, cx + cw + 20, hud_y + ch + 14],
-        radius=20,
-        fill=(15, 23, 42, 220),
-        outline=(56, 189, 248, 220),
-        width=2,
-    )
-    draw.text((cx, hud_y), counter_str, font=font_hud, fill=(56, 189, 248, 255))
-
-    badge_text = f"LIVE TREND: {trend_badge.upper()[:24]}"
-    bb = draw.textbbox((0, 0), badge_text, font=font_hud)
-    bw, bh = bb[2] - bb[0], bb[3] - bb[1]
-    bx = 75
-    draw.rounded_rectangle(
-        [bx - 22, hud_y - 12, bx + bw + 52, hud_y + bh + 14],
-        radius=20,
-        fill=(220, 38, 38, 235),
-    )
-    pulse_r = 9 if (event.step_seed % 2 == 0) else 6
-    dot_cx, dot_cy = bx + 6, hud_y + bh // 2 + 2
-    draw.ellipse(
-        [dot_cx - pulse_r, dot_cy - pulse_r, dot_cx + pulse_r, dot_cy + pulse_r],
-        fill=(255, 255, 255, 255),
-    )
-    draw.text((bx + 26, hud_y), badge_text, font=font_hud, fill=(255, 255, 255, 255))
-
-    # --- 2. Animated Headline Banner ---
-    slide_offset_y = -22 if is_scene_intro else 0
+    # --- Animated Headline Banner (Top HUD Trend Pill & Scene Counter removed per user request) ---
+    slide_offset_y = -18 if is_scene_intro else 0
     wrapped_head = textwrap.wrap(headline.upper(), width=20)[:2]
-    hy = 235 + slide_offset_y
+    hy = 185 + slide_offset_y
 
     card_h = len(wrapped_head) * 68 + 32
     draw.rounded_rectangle(
