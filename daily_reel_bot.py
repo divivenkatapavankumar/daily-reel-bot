@@ -1275,8 +1275,24 @@ def upload_to_instagram_instagrapi(video_path: Path, script: ReelScript, config:
     from instagrapi import Client
 
     cl = Client()
+    session_data = None
     if config.ig_session_json:
-        cl.set_settings(json.loads(config.ig_session_json))
+        try:
+            session_data = json.loads(config.ig_session_json)
+        except Exception:
+            pass
+    if not session_data and Path("ig_session.json").exists():
+        try:
+            session_data = json.loads(Path("ig_session.json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if session_data:
+        try:
+            cl.set_settings(session_data)
+        except Exception:
+            pass
+
     cl.login(config.ig_username, config.ig_password)
     thumb_path = video_path.with_suffix(".jpg")
     if not thumb_path.exists():
@@ -1290,9 +1306,11 @@ def upload_to_instagram_instagrapi(video_path: Path, script: ReelScript, config:
         except Exception:
             pass
 
-    logger.info("Uploading Reel via instagrapi...")
+    logger.info("Uploading Reel via instagrapi (this may take 1-2 minutes)...")
     media = cl.clip_upload(str(video_path), caption=script.caption, thumbnail=thumb_path if thumb_path.exists() else None)
-    logger.info("Published to Instagram Reels via instagrapi (pk=%s)", media.pk)
+    reel_url = f"https://www.instagram.com/reel/{media.code}/"
+    logger.info("Published to Instagram Reels via instagrapi (pk=%s, url=%s)", media.pk, reel_url)
+    print(f"\nREEL_PUBLISHED_URL={reel_url}\n")
     return str(media.pk)
 
 
