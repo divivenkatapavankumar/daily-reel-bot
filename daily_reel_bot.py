@@ -320,7 +320,14 @@ Task:
 }}"""
 
     candidate_models = [config.gemini_model]
-    for alt in ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]:
+    for alt in [
+        "gemini-3.5-flash",
+        "gemini-flash-latest",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash-lite",
+    ]:
         if alt not in candidate_models:
             candidate_models.append(alt)
 
@@ -329,6 +336,7 @@ Task:
         for m in candidate_models:
             for attempt in range(3):
                 try:
+                    logger.info("Calling Gemini model: %s (attempt %d/3)...", m, attempt + 1)
                     return client.models.generate_content(
                         model=m,
                         contents=prompt_text,
@@ -341,8 +349,13 @@ Task:
                     last_exc = exc
                     err = str(exc)
                     logger.warning("Gemini attempt %d on %s failed: %s", attempt + 1, m, exc)
+                    if "404" in err or "NOT_FOUND" in err or "no longer available" in err:
+                        # Model deprecated or unavailable to this key; move to next model immediately
+                        break
                     if "503" in err or "429" in err or "UNAVAILABLE" in err:
-                        time.sleep(2 * (attempt + 1))
+                        backoff = min(3 * (attempt + 1), 10)
+                        logger.info("High demand or rate limit encountered. Waiting %ds before retry...", backoff)
+                        time.sleep(backoff)
                         continue
                     break
         raise RuntimeError(f"All Gemini model attempts failed: {last_exc}")
@@ -1093,10 +1106,16 @@ def render_scene_clip(
         "veryfast",
         "-crf",
         "22",
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
         "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
         "-shortest",
         str(scene_final),
     ]
@@ -1172,7 +1191,9 @@ def assemble_full_reel(
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     final_mp4 = config.output_dir / f"reel_{timestamp}.mp4"
 
-    cmd = [
+    # Fast stream copy concatenation (takes ~1-2 seconds)
+    logger.info("Concatenating %d scene clips into final Reel...", len(scene_clips))
+    cmd_copy = [
         "ffmpeg",
         "-y",
         "-f",
@@ -1183,23 +1204,43 @@ def assemble_full_reel(
         str(concat_file),
         "-t",
         str(config.max_video_seconds),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "21",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        "-c",
+        "copy",
         "-movflags",
         "+faststart",
         str(final_mp4),
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    res = subprocess.run(cmd_copy, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if res.returncode != 0 or not final_mp4.exists() or get_media_duration(final_mp4) < 1.0:
+        logger.warning("Fast stream copy concat failed; falling back to ultrafast encode...")
+        cmd_reencode = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-t",
+            str(config.max_video_seconds),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(final_mp4),
+        ]
+        subprocess.run(cmd_reencode, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     logger.info("Final animated Instagram Reel saved to %s (%.1fs)", final_mp4, get_media_duration(final_mp4))
     return final_mp4
 

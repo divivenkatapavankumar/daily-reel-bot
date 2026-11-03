@@ -2,8 +2,8 @@ name: Daily Autonomous Instagram Reel Bot
 
 on:
   schedule:
-    # Runs every day at 12:30 UTC (18:00 IST / 08:30 EDT)
-    - cron: '30 12 * * *'
+    # Runs every day at 12:35 UTC (18:05 IST / 08:35 EDT) - off-peak minute avoids GitHub cron delays
+    - cron: '35 12 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -46,6 +46,7 @@ jobs:
       - name: Run Daily Instagram Reel Pipeline (2+ Min Kinetic Edition)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3.5-flash' }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TREND_GEO: ${{ vars.TREND_GEO || 'IN' }}
           NICHE_FILTER: ${{ vars.NICHE_FILTER || 'technology, AI, science, business, finance, or fascinating world news' }}
@@ -60,6 +61,9 @@ jobs:
           IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
           IG_SESSION_JSON: ${{ secrets.IG_SESSION_JSON }}
         run: |
+          if [ -n "$IG_SESSION_JSON" ]; then
+            echo "$IG_SESSION_JSON" > ig_session.json
+          fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             python daily_reel_bot.py --dry-run
           else
